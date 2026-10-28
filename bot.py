@@ -1,105 +1,150 @@
 import os
 import telebot
-from telebot import types
 import subprocess
-import threading
+import json
+from io import BytesIO
+import pytesseract
+from PIL import Image
 
-# Konfigurasi - token diambil dari environment variable
+# Konfigurasi
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not TOKEN:
-    raise SystemExit("ERROR: TELEGRAM_BOT_TOKEN belum diset. Set lewat environment variable atau file .env")
+    raise SystemExit("ERROR: TELEGRAM_BOT_TOKEN belum diset")
 
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(TOKEN, threaded=True)
 
-# Cek apakah opencode tersedia di system
+# Simpan session ID per user untuk multi-turn conversation
+user_sessions = {}
+
+# Cek opencode
 try:
     subprocess.run(['opencode', '--version'], capture_output=True, timeout=5)
     HAS_OPENCODE = True
 except Exception:
     HAS_OPENCODE = False
-    print(f"[INFO] opencode tidak tersedia di environment ini. Bot akan menggunakan fallback response.")
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
+    user_id = message.chat.id
+    if user_id in user_sessions:
+        del user_sessions[user_id]
+    
     bot.reply_to(message, 
         "Halo! Saya asisten pribadi OpenCode Anda.\n\n"
-        "Cukup ketik pertanyaan langsung, saya akan membantu!\n\n"
-        "Perintah:\n"
-        "/status - Cek status bot\n"
-        "/help - Tampilkan bantuan")
+        "✅ Chat bolak-balik dengan memory\n"
+        "📷 Kirim foto untuk OCR & analisis\n\n"
+        "/reset - Mulai percakapan baru\n"
+        "/status - Cek status bot")
 
 @bot.message_handler(commands=['status'])
 def send_status(message):
+    user_id = message.chat.id
+    has_session = user_id in user_sessions
     status = "🟢 Bot aktif"
-    status += " - Terhubung ke OpenCode" if HAS_OPENCODE else " - Mode fallback (OpenCode tidak tersedia di server)"
+    status += " - Terhubung ke OpenCode" if HAS_OPENCODE else " - Mode fallback"
+    if has_session:
+        status += f"\n💬 Session aktif: {user_sessions[user_id][:20]}..."
     bot.reply_to(message, status)
 
-@bot.message_handler(commands=['ask'])
-def handle_ask(message):
-    user_text = message.text.replace('/ask', '').strip()
-    if not user_text:
-        bot.reply_to(message, "Silakan masukkan pertanyaan Anda.")
-        return
-    process_question(message, user_text)
+@bot.message_handler(commands=['reset'])
+def reset_chat(message):
+    user_id = message.chat.id
+    if user_id in user_sessions:
+        del user_sessions[user_id]
+    bot.reply_to(message, "🔄 Percakapan di-reset. Mulai chat baru sekarang!")
+
+@bot.message_handler(content_types=['photo'])
+def handle_photo(message):
+    try:
+        photo = message.photo[-1]
+        file_info = bot.get_file(photo.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        img = Image.open(BytesIO(downloaded_file))
+        extracted_text = pytesseract.image_to_string(img, lang='ind+eng').strip()
+        
+        if not extracted_text:
+            extracted_text = "(Tidak ada teks terdeteksi)"
+        
+        caption = message.caption or "Jelaskan teks ini:"
+        prompt = f"{caption}\n\n{extracted_text}"
+        
+        process_question(message, prompt)
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {str(e)}")
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     process_question(message, message.text)
 
-def generate_fallback_response(user_text):
-    """Jawaban sederhana tanpa OpenCode (untuk deploy cloud)"""
-    lower = user_text.lower()
-    if any(word in lower for word in ['halo', 'hai', 'hi', 'assalam']):
-        return "Halo! 👋 Ada yang bisa saya bantu?"
-    elif any(word in lower for word in ['thank', 'makasih', 'terima kasih', 'thanks']):
-        return "Sama-sama! Ada lagi yang bisa saya bantu? 😊"
-    elif any(word in lower for word in ['python', 'python', 'code', 'koding']):
-        return "Untuk pertanyaan coding, saya sarankan menggunakan OpenCode Desktop di laptop Anda untuk hasil terbaik. Bot ini akan memprosesnya secara langsung saat dijalankan secara lokal."
-    else:
-        return f"Pertanyaan: {user_text}\n\nMohon maaf, saat ini bot berjalan di cloud tanpa akses OpenCode penuh.\nUntuk asisten AI yang lebih lengkap, jalankan bot di laptop Anda dengan OpenCode-Desktop."
-
 def process_question(message, user_text):
-    # Kirim notifikasi sedang memproses
-    processing_msg = bot.reply_to(message, "⏳ Sedang memproses, mohon tunggu...")
+    user_id = message.chat.id
     
     try:
         if HAS_OPENCODE:
-            # Tambahkan instruksi untuk menjawab dalam Bahasa Indonesia
-            prompt = f"Jawab dalam Bahasa Indonesia secara ringkas dan jelas: {user_text}"
+            prompt = f"Jawab dalam Bahasa Indonesia ringkas: {user_text}"
+            
+            # Bangun command
+            cmd = ['opencode', 'run', '--format', 'json']
+            
+            # Jika user sudah punya session, continue
+            if user_id in user_sessions:
+                cmd.extend(['--session', user_sessions[user_id], '--continue'])
+            
+            cmd.append(prompt)
             
             process = subprocess.Popen(
-                ['opencode', 'run', prompt],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True
             )
-            stdout, stderr = process.communicate(timeout=120)  # timeout 2 menit
+            stdout, stderr = process.communicate(timeout=120)
             
             if process.returncode == 0 and stdout.strip():
-                response = stdout.strip()
-                bot.delete_message(message.chat.id, processing_msg.message_id)
+                # Parse JSON lines untuk ekstrak text dan session ID
+                response_text = ""
+                session_id = None
+                
+                for line in stdout.strip().split('\n'):
+                    try:
+                        data = json.loads(line)
+                        
+                        # Simpan session ID dari response pertama
+                        if session_id is None and 'sessionID' in data:
+                            session_id = data['sessionID']
+                        
+                        # Ambil text response
+                        if data.get('type') == 'text' and 'part' in data:
+                            text = data['part'].get('text', '')
+                            if text:
+                                response_text += text
+                    except json.JSONDecodeError:
+                        continue
+                
+                # Simpan session ID untuk percakapan berikutnya
+                if session_id:
+                    user_sessions[user_id] = session_id
+                
+                response = response_text.strip() if response_text else "❌ OpenCode tidak memberikan respons."
             else:
-                response = generate_fallback_response(user_text)
-                bot.delete_message(message.chat.id, processing_msg.message_id)
+                response = "❌ OpenCode error. Coba lagi."
         else:
-            response = generate_fallback_response(user_text)
-            bot.delete_message(message.chat.id, processing_msg.message_id)
-
-        # Potong jika terlalu panjang (batas Telegram 4096 karakter)
+            response = "❌ OpenCode tidak tersedia."
+        
+        # Potong jika terlalu panjang
         if len(response) > 4000:
-            response = response[:4000] + "\n\n... (pesan terpotong)"
+            response = response[:4000] + "\n\n... (terpotong)"
         
         bot.reply_to(message, response)
         
     except subprocess.TimeoutExpired:
-        bot.delete_message(message.chat.id, processing_msg.message_id)
-        bot.reply_to(message, "⏱️ Waktu pemrosesan habis. Coba pertanyaan yang lebih singkat.")
+        bot.reply_to(message, "⏱️ Timeout. Coba pertanyaan lebih singkat.")
     except Exception as e:
-        bot.delete_message(message.chat.id, processing_msg.message_id)
-        bot.reply_to(message, f"Maaf, terjadi kesalahan: {str(e)}")
+        bot.reply_to(message, f"❌ Error: {str(e)}")
 
 if __name__ == '__main__':
-    print("Bot Telegram OpenCode sedang berjalan...")
-    print(f"Mode: {'OpenCode' if HAS_OPENCODE else 'Fallback'}")
-    print("Kirim pesan ke bot Anda di Telegram untuk memulai.")
-    bot.polling(none_stop=True)
+    print("🚀 Bot berjalan dengan multi-turn conversation support!")
+    print("📝 Setiap user memiliki session chat terpisah dengan memory")
+    bot.polling(none_stop=True, timeout=60)
